@@ -5,11 +5,8 @@
 #pragma once
 
 #include "openvino/op/op.hpp"
-#include "openvino/op/util/attr_types.hpp"
 
-namespace ov {
-namespace op {
-namespace util {
+namespace ov::op::util {
 /// \brief Base class for color conversion operation from RGB/BGR to NV12 format.
 ///    Input:
 ///        - Operation expects input shape in NHWC layout.
@@ -33,10 +30,6 @@ namespace util {
 ///        UV plane is subsampled by averaging each 2x2 block of pixels.
 ///
 class OPENVINO_API ConvertColorToNV12Base : public Op {
-public:
-    /// \brief Exact conversion format details
-    enum class ColorConversion : int { RGB_TO_NV12 = 0, BGR_TO_NV12 = 1 };
-
 protected:
     ConvertColorToNV12Base() = default;
 
@@ -44,20 +37,16 @@ protected:
     /// Default output is single-plane NV12.
     ///
     /// \param arg          Node that produces the input tensor. Input tensor represents image in RGB/BGR format (NHWC).
-    /// \param format       Conversion format.
-    explicit ConvertColorToNV12Base(const Output<Node>& arg, ColorConversion format);
+    explicit ConvertColorToNV12Base(const Output<Node>& arg);
 
     /// \brief Constructs a conversion operation from input image in RGB/BGR format with configurable output.
     ///
     /// \param arg          Node that produces the input tensor. Input tensor represents image in RGB/BGR format (NHWC).
-    /// \param format       Conversion format.
     /// \param single_plane If true, output is single-plane NV12; if false, output is Y and UV as separate planes.
-    ConvertColorToNV12Base(const Output<Node>& arg, ColorConversion format, bool single_plane);
+    ConvertColorToNV12Base(const Output<Node>& arg, bool single_plane);
 
 public:
-    OPENVINO_OP("ConvertColorToRGBBase", "util");
-
-    void validate_and_infer_types() override;
+    OPENVINO_OP("ConvertColorToNV12Base", "util");
 
     bool visit_attributes(AttributeVisitor& visitor) override;
 
@@ -66,11 +55,6 @@ public:
     }
 
 protected:
-    bool is_type_supported(const ov::element::Type& type) const;
-
-    ColorConversion m_format = ColorConversion::RGB_TO_NV12;
     bool m_single_plane = true;
 };
-}  // namespace util
-}  // namespace op
-}  // namespace ov
+}  // namespace ov::op::util

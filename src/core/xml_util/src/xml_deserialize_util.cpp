@@ -65,12 +65,9 @@ bool getParameters(const pugi::xml_node& node, const std::string& name, std::vec
 
 template <class T>
 T stringToType(const std::string& valStr) {
-    T ret{0};
-    std::istringstream ss(valStr);
-    if (!ss.eof()) {
-        ss >> ret;
-    }
-    return ret;
+    auto result = ov::util::view_to_number<T>(ov::util::trim(valStr));
+    OPENVINO_ASSERT(result.has_value(), "Cannot parse '", valStr, "' to number");
+    return *result;
 }
 
 bool get_partial_shape_from_attribute(const pugi::xml_node& node, const std::string& name, PartialShape& value) {
@@ -78,14 +75,6 @@ bool get_partial_shape_from_attribute(const pugi::xml_node& node, const std::str
     if (!getStrAttribute(node, name, param))
         return false;
     value = PartialShape(param);
-    return true;
-}
-
-bool get_dimension_from_attribute(const pugi::xml_node& node, const std::string& name, Dimension& value) {
-    std::string param;
-    if (!getStrAttribute(node, name, param))
-        return false;
-    value = Dimension(param);
     return true;
 }
 
@@ -437,8 +426,10 @@ ov::Any XmlDeserializer::parse_weightless_cache_attribute(const pugi::xml_node& 
         const auto offset = data_node.attribute("offset");
         const auto element_type = data_node.attribute("element_type");
         if (size && offset && element_type) {
-            wl_attr = ov::WeightlessCacheAttribute(static_cast<size_t>(pugixml::get_uint64_attr(data_node, "size")),
-                                                   static_cast<size_t>(pugixml::get_uint64_attr(data_node, "offset")),
+            const auto original_size = static_cast<size_t>(pugixml::get_uint64_attr(data_node, "size"));
+            const auto bin_offset = static_cast<size_t>(pugixml::get_uint64_attr(data_node, "offset"));
+            wl_attr = ov::WeightlessCacheAttribute(original_size,
+                                                   bin_offset,
                                                    ov::element::Type(pugixml::get_str_attr(data_node, "element_type")));
         }
     }
@@ -750,10 +741,9 @@ void XmlDeserializer::on_adapter(const std::string& name, ov::ValueAccessor<void
             return;
         a->set(shape);
     } else if (auto a = ov::as_type<ov::AttributeAdapter<Dimension>>(&adapter)) {
-        Dimension dim;
-        if (!get_dimension_from_attribute(m_node.child("data"), name, dim))
-            return;
-        a->set(dim);
+        if (const auto dim_str = util::pugixml::get_attribute_view(m_node.child("data"), name); dim_str.has_value()) {
+            a->set(Dimension(*dim_str));
+        }
     } else if (auto a = ov::as_type<ov::AttributeAdapter<ov::Shape>>(&adapter)) {
         std::vector<size_t> shape;
         if (!getParameters<size_t>(m_node.child("data"), name, shape))
@@ -904,7 +894,8 @@ void XmlDeserializer::set_constant_num_buffer(ov::AttributeAdapter<std::shared_p
 
     const auto size = static_cast<size_t>(pugixml::get_uint64_attr(dn, "size"));
     const auto offset = static_cast<size_t>(pugixml::get_uint64_attr(dn, "offset"));
-    OPENVINO_ASSERT(m_weights->size() >= offset + size, "Incorrect weights in bin file!");
+    OPENVINO_ASSERT(offset <= m_weights->size() && size <= m_weights->size() - offset,
+                    "Incorrect weights in bin file!");
 
     char* data = m_weights->get_ptr<char>() + offset;
 

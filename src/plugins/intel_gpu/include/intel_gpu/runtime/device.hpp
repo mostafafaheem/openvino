@@ -13,6 +13,8 @@
 namespace cldnn {
 
 const uint32_t INTEL_VENDOR_ID = 0x8086;
+const uint32_t NVIDIA_VENDOR_ID = 0x10DE;
+const uint32_t AMD_VENDOR_ID = 0x1002;
 
 /// @brief Represents detected GPU device object. Use device_query to get list of available objects.
 struct device {
@@ -41,11 +43,11 @@ public:
 inline size_t get_device_priority(const cldnn::device_info& info) {
     if (info.vendor_id == cldnn::INTEL_VENDOR_ID && info.dev_type == cldnn::device_type::integrated_gpu) {
         return 0;
-    } else if (info.vendor_id == cldnn::INTEL_VENDOR_ID) {
-        return 1;
-    } else {
-        return std::numeric_limits<size_t>::max();
     }
+    if (info.vendor_id == cldnn::INTEL_VENDOR_ID) {
+        return 1;
+    }
+    return std::numeric_limits<size_t>::max();
 }
 
 inline std::vector<device::ptr> sort_devices(const std::vector<device::ptr>& devices_list) {
