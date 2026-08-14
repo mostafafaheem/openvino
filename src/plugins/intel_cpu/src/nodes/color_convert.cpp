@@ -11,10 +11,12 @@
 #include <memory>
 #include <oneapi/dnnl/dnnl_common.hpp>
 #include <openvino/core/type.hpp>
+#include <openvino/op/bgr_to_nv12.hpp>
 #include <openvino/op/i420_to_bgr.hpp>
 #include <openvino/op/i420_to_rgb.hpp>
 #include <openvino/op/nv12_to_bgr.hpp>
 #include <openvino/op/nv12_to_rgb.hpp>
+#include <openvino/op/rgb_to_nv12.hpp>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -29,6 +31,7 @@
 #include "openvino/core/except.hpp"
 #include "openvino/core/node.hpp"
 #include "openvino/core/type/element_type.hpp"
+#include "openvino/reference/utils/convert_color_util.hpp"
 #include "openvino/runtime/system_conf.hpp"
 #include "shape_inference/custom/color_convert.hpp"
 
@@ -65,6 +68,12 @@ std::tuple<Algorithm, std::string> getAlgorithmFor(const std::shared_ptr<const o
     if (ov::is_type<ov::op::v8::I420toBGR>(op)) {
         return std::make_tuple(Algorithm::ColorConvertI420toBGR, std::string());
     }
+    if (ov::is_type<ov::op::v17::RGBtoNV12>(op)) {
+        return std::make_tuple(Algorithm::ColorConvertRGBtoNV12, std::string());
+    }
+    if (ov::is_type<ov::op::v17::BGRtoNV12>(op)) {
+        return std::make_tuple(Algorithm::ColorConvertBGRtoNV12, std::string());
+    }
     return std::make_tuple(Algorithm::Default, std::string("Type ") + op->get_type_name() + " is not supported.");
 }
 
@@ -83,29 +92,13 @@ public:
 Converter::Converter(Node* node)
     : Base(node,
            node->getAlgorithm() == Algorithm::ColorConvertNV12toRGB ||
-                   node->getAlgorithm() == Algorithm::ColorConvertI420toRGB
+                   node->getAlgorithm() == Algorithm::ColorConvertI420toRGB ||
+                   node->getAlgorithm() == Algorithm::ColorConvertRGBtoNV12
                ? ColorFormat{{0, 1, 2}}
                : ColorFormat{{2, 1, 0}}) {}
 
 bool Converter::singlePlane() const {
     return _node->getOriginalInputsNumber() == 1;
-}
-
-template <typename T>
-std::tuple<T, T, T> Converter::yuv_to_rgb(float y, float u, float v) {
-    auto c = y - 16.F;
-    auto d = u - 128.F;
-    auto e = v - 128.F;
-    auto clip = [](float a) -> T {
-        if (std::is_integral<T>()) {
-            return static_cast<T>(std::min(std::max(std::round(a), 0.F), 255.F));
-        }
-        return static_cast<T>(std::min(std::max(a, 0.F), 255.F));
-    };
-    auto r = clip(1.164F * c + 1.596F * e);
-    auto g = clip(1.164F * c - 0.391F * d - 0.813F * e);
-    auto b = clip(1.164F * c + 2.018F * d);
-    return std::make_tuple(r, g, b);
 }
 
 #if defined(OPENVINO_ARCH_X86_64)
@@ -369,7 +362,7 @@ void RefConverter::convert(const T* y,
             auto uv_index = (h / 2) * width + (w / 2) * 2;
             auto u_val = static_cast<float>(uv_ptr[uv_index]);
             auto v_val = static_cast<float>(uv_ptr[uv_index + 1]);
-            auto [r, g, b] = yuv_to_rgb<T>(y_val, u_val, v_val);
+            auto [r, g, b] = ov::reference::yuv_pixel_to_rgb<T>(y_val, u_val, v_val);
             out[y_index * 3 + _colorFormat[0]] = r;
             out[y_index * 3 + _colorFormat[1]] = g;
             out[y_index * 3 + _colorFormat[2]] = b;
@@ -703,7 +696,7 @@ void RefConverter::convert(const T* y,
             auto uv_index = (h / 2) * (width / 2) + w / 2;
             auto u_val = static_cast<float>(u_ptr[uv_index]);
             auto v_val = static_cast<float>(v_ptr[uv_index]);
-            auto [r, g, b] = yuv_to_rgb<T>(y_val, u_val, v_val);
+            auto [r, g, b] = ov::reference::yuv_pixel_to_rgb<T>(y_val, u_val, v_val);
             out[y_index * 3 + _colorFormat[0]] = r;
             out[y_index * 3 + _colorFormat[1]] = g;
             out[y_index * 3 + _colorFormat[2]] = b;
@@ -970,6 +963,159 @@ public:
 #endif
 }  // namespace i420
 
+namespace rgb_to_nv12 {
+
+ColorConvert::Converter::PrimitiveDescs supportedPrimitiveDescs(Node* node) {
+    const LayoutType layout = LayoutType::ncsp;
+
+    const ov::element::Type precision =
+        node->getOriginalInputPrecisionAtPort(0) == ov::element::u8 ? ov::element::u8 : ov::element::f32;
+
+    ColorConvert::Converter::PrimitiveDescs descs;
+
+    std::vector<PortConfigurator> outConfigs(node->getOriginalOutputsNumber(), PortConfigurator{layout, precision});
+
+    descs.emplace_back(std::vector<PortConfigurator>{{layout, precision}},
+                       outConfigs,
+                       impl_desc_type::ref,
+                       true);
+
+    return descs;
+}
+
+template <typename T, impl_desc_type I>
+class SinglePlaneConvert;
+template <typename T, impl_desc_type I>
+class TwoPlaneConvert;
+
+class RefConverter : public ColorConvert::Converter {
+    using Base = ColorConvert::Converter;
+
+public:
+    explicit RefConverter(Node* node)
+        : Base(node,
+               // RGBtoNV12: R is channel 0;  BGRtoNV12: R is channel 2.
+               node->getAlgorithm() == Algorithm::ColorConvertRGBtoNV12 ? ColorFormat{{0, 1, 2}}
+                                                                         : ColorFormat{{2, 1, 0}}) {
+        OPENVINO_ASSERT(node->getOriginalInputsNumber() == 1,
+                        "RGBtoNV12/BGRtoNV12 node must have exactly 1 input");
+        const auto nout = node->getOriginalOutputsNumber();
+        OPENVINO_ASSERT(nout == 1 || nout == 2, "RGBtoNV12/BGRtoNV12 node must have 1 or 2 outputs");
+    }
+
+protected:
+    template <typename T>
+    void convert(const T* src,
+                 T* dst_y,
+                 T* dst_uv,
+                 size_t batch_size,
+                 size_t height,
+                 size_t width,
+                 size_t stride_in,
+                 size_t stride_y,
+                 size_t stride_uv,
+                 const CpuParallelPtr& cpu_parallel) {
+        const size_t r_idx = _colorFormat[0];  // RGB: 0, BGR: 2
+        const size_t g_idx = _colorFormat[1];  // always 1
+        const size_t b_idx = _colorFormat[2];  // RGB: 2, BGR: 0
+
+        // Process pairs of rows so UV (2x2 subsampled) can be averaged over all 4 pixels.
+        cpu_parallel->parallel_for2d(batch_size, height / 2, [&](int batch, int half_h) {
+            const size_t h0 = static_cast<size_t>(half_h) * 2;
+            const size_t h1 = h0 + 1;
+
+            const T* src0 = src + static_cast<size_t>(batch) * stride_in + h0 * width * 3;
+            const T* src1 = src + static_cast<size_t>(batch) * stride_in + h1 * width * 3;
+            T* y_out0 = dst_y + static_cast<size_t>(batch) * stride_y + h0 * width;
+            T* y_out1 = dst_y + static_cast<size_t>(batch) * stride_y + h1 * width;
+
+            T* uv_out = dst_uv + static_cast<size_t>(batch) * stride_uv +
+                        static_cast<size_t>(half_h) * width;
+
+            for (size_t w = 0; w < width; w += 2) {
+                double u_sum = 0.0, v_sum = 0.0;
+
+                auto process_pixel = [&](const T* row, T* y_row, size_t col) {
+                    T y_val, u_val, v_val;
+                    std::tie(y_val, u_val, v_val) =
+                        ov::reference::rgb_pixel_to_yuv<T>(row[col * 3 + r_idx],
+                                                           row[col * 3 + g_idx],
+                                                           row[col * 3 + b_idx]);
+                    y_row[col] = y_val;
+                    u_sum += static_cast<double>(u_val);
+                    v_sum += static_cast<double>(v_val);
+                };
+
+                process_pixel(src0, y_out0, w);
+                process_pixel(src0, y_out0, w + 1);
+                process_pixel(src1, y_out1, w);
+                process_pixel(src1, y_out1, w + 1);
+
+                uv_out[w]     = ov::reference::round_cast<T>(u_sum / 4.0);  // U
+                uv_out[w + 1] = ov::reference::round_cast<T>(v_sum / 4.0);  // V
+            }
+        });
+    }
+};
+
+template <typename T>
+class SinglePlaneConvert<T, impl_desc_type::ref> : public RefConverter {
+public:
+    using RefConverter::RefConverter;
+
+    void execute(const CpuParallelPtr& cpu_parallel, [[maybe_unused]] const dnnl::stream& strm) override {
+        const auto& in_dims = inputDims(0);
+        const size_t batch_size = in_dims[N_DIM];
+        const size_t height = in_dims[H_DIM];
+        const size_t width = in_dims[W_DIM];
+
+        const T* src = static_cast<const T*>(input(0));
+        T* dst = static_cast<T*>(output(0));
+
+        const size_t out_stride = height * width * 3 / 2;
+
+        convert<T>(src,
+                   dst,
+                   dst + height * width,
+                   batch_size,
+                   height,
+                   width,
+                   height * width * 3,
+                   out_stride,
+                   out_stride,
+                   cpu_parallel);
+    }
+};
+
+template <typename T>
+class TwoPlaneConvert<T, impl_desc_type::ref> : public RefConverter {
+public:
+    using RefConverter::RefConverter;
+
+    void execute(const CpuParallelPtr& cpu_parallel, [[maybe_unused]] const dnnl::stream& strm) override {
+        const auto& in_dims = inputDims(0);
+        const size_t batch_size = in_dims[N_DIM];
+        const size_t height = in_dims[H_DIM];
+        const size_t width = in_dims[W_DIM];
+
+        const T* src = static_cast<const T*>(input(0));
+        T* dst_y = static_cast<T*>(output(0));
+        T* dst_uv = static_cast<T*>(output(1));
+
+        convert<T>(src,
+                   dst_y,
+                   dst_uv,
+                   batch_size,
+                   height,
+                   width,
+                   height * width * 3,
+                   height * width,
+                   height * width / 2,
+                   cpu_parallel);
+    }
+};
+
+}  // namespace rgb_to_nv12
 }  // namespace
 
 ColorConvert::Converter::Converter(Node* node, const ColorFormat& colorFormat)
@@ -1041,6 +1187,17 @@ void ColorConvert::initSupportedPrimitiveDescriptors() {
         initSupportedI420Impls();
         break;
     }
+    case Algorithm::ColorConvertRGBtoNV12:
+    case Algorithm::ColorConvertBGRtoNV12: {
+        for (const auto& desc : rgb_to_nv12::supportedPrimitiveDescs(this)) {
+            const auto& inPortConfigs = std::get<0>(desc);
+            const auto& outPortConfigs = std::get<1>(desc);
+            const auto implType = std::get<2>(desc);
+            addSupportedPrimDesc(inPortConfigs, outPortConfigs, implType);
+        }
+        initSupportedtoNV12Impls();
+        break;
+    }
     default:
         break;
     }
@@ -1102,6 +1259,23 @@ void ColorConvert::initSupportedI420Impls() {
 #undef SUPPORTED_IMPL
 }
 
+void ColorConvert::initSupportedtoNV12Impls() {
+#define SUPPORTED_IMPL(Impl, type, desc_type)                              \
+    [](Node* node) {                                                       \
+        return new rgb_to_nv12::Impl<type, impl_desc_type::desc_type>(node); \
+    };
+
+    // ref — the only implementation for now; JIT support will be added later.
+    {
+        auto& impls = _supportedImpls[impl_desc_type::ref][algorithm];
+        impls[ov::element::Type_t::u8][true]  = SUPPORTED_IMPL(SinglePlaneConvert, uint8_t, ref);
+        impls[ov::element::Type_t::u8][false] = SUPPORTED_IMPL(TwoPlaneConvert,    uint8_t, ref);
+        impls[ov::element::Type_t::f32][true]  = SUPPORTED_IMPL(SinglePlaneConvert, float,   ref);
+        impls[ov::element::Type_t::f32][false] = SUPPORTED_IMPL(TwoPlaneConvert,    float,   ref);
+    }
+#undef SUPPORTED_IMPL
+}
+
 void ColorConvert::createPrimitive() {
     const NodeDesc* desc = getSelectedPrimitiveDescriptor();
     CPU_NODE_ASSERT(desc, "has no optimal primitive descriptor selected");
@@ -1109,7 +1283,17 @@ void ColorConvert::createPrimitive() {
     if (!_impl) {
         const auto& cfg = desc->getConfig();
         const auto precision = cfg.inConfs[0].getMemDesc()->getPrecision();
-        const bool isSinglePlane = cfg.inConfs.size() == 1;
+
+        // For RGB/BGR→NV12 the input is always a single RGB/BGR tensor, so we cannot
+        // use input-port count to distinguish single vs. two-plane output.  Use the
+        // output-port count instead.
+        bool isSinglePlane;
+        if (algorithm == Algorithm::ColorConvertRGBtoNV12 ||
+            algorithm == Algorithm::ColorConvertBGRtoNV12) {
+            isSinglePlane = cfg.outConfs.size() == 1;
+        } else {
+            isSinglePlane = cfg.inConfs.size() == 1;
+        }
 
         _impl = std::unique_ptr<Converter>(
             _supportedImpls.at(desc->getImplementationType()).at(algorithm).at(precision).at(isSinglePlane)(this));
