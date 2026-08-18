@@ -977,7 +977,7 @@ ColorConvert::Converter::PrimitiveDescs supportedPrimitiveDescs(Node* node) {
 
     descs.emplace_back(std::vector<PortConfigurator>{{layout, precision}},
                        outConfigs,
-                       impl_desc_type::ref,
+                       ov::with_cpu_x86_sse42() ? impl_desc_type::jit_uni : impl_desc_type::ref,
                        true);
 
     return descs;
@@ -1114,6 +1114,689 @@ public:
                    cpu_parallel);
     }
 };
+
+#if defined(OPENVINO_ARCH_X86_64)
+
+// ---------------------------------------------------------------------------
+// JIT kernel: RGB/BGR row-pair → Y row-pair + UV row
+// ---------------------------------------------------------------------------
+//
+// The kernel is called once per (batch, half_row) pair.  It processes N pixels
+// at a time using SIMD, where N is the vector width (4/8/16 floats for
+// SSE41/AVX2/AVX512).  Because UV is 2×2 sub-sampled we process two full
+// input rows together so we can horizontally and vertically average four U/V
+// values into each output UV pair.
+//
+// Params layout re-uses the existing jit_uni_converter::Params fields:
+//   y   → ptr to RGB row 0 (interleaved, 3 elements per pixel)
+//   u   → ptr to RGB row 1
+//   v   → ptr to Y output row 1        (dst_y1)
+//   dst → ptr to Y output row 0        (dst_y0)
+//   width → number of pixels per row (must be even)
+//   colorFormat → 0 = first channel is R, !=0 = first channel is B
+//
+// We repurpose the existing Params struct to avoid introducing a second
+// function-pointer typedef; the UV output pointer is passed as a separate
+// member that we add via a sub-struct below.
+// ---------------------------------------------------------------------------
+
+struct jit_rgb_to_nv12_converter : public jit_kernel {
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_rgb_to_nv12_converter)
+
+    // We extend the existing Params by tacking a dst_uv pointer after the
+    // standard fields.  Offsets must match the field layout exactly.
+    struct Params {
+        const void* src0;     // interleaved RGB/BGR row 0
+        const void* src1;     // interleaved RGB/BGR row 1
+        void*       dst_y0;   // Y output for row 0
+        void*       dst_y1;   // Y output for row 1
+        void*       dst_uv;   // interleaved UV output (width/2 pairs)
+        size_t      width;    // pixels per row
+        uint8_t     colorFmt; // 0 = RGB input, else BGR input
+    };
+
+    using function_t = void (*)(const Params*);
+
+    void init();
+
+    void operator()(const Params& args) const {
+        _fn(&args);
+    }
+
+protected:
+    jit_rgb_to_nv12_converter();
+
+    // Deinterleave three packed vectors [v0,v1,v2] (each N floats) that
+    // together hold N pixels of interleaved RGB data:
+    //   v0 = [R0,G0,B0, R1,G1,B1, R2,G2, ...]
+    // into separate channel registers ch0, ch1, ch2.
+    // The permutation is the exact inverse of jit_uni_converter::blend().
+    template <size_t N>
+    void deinterleave(const variable<float[N]>& v0,
+                      const variable<float[N]>& v1,
+                      const variable<float[N]>& v2,
+                      const variable<float[N]>& ch0,
+                      const variable<float[N]>& ch1,
+                      const variable<float[N]>& ch2);
+
+    // Compute Y from (R,G,B) in-place: Y = clip(0.257R + 0.504G + 0.098B + 16)
+    // Also returns U = clip(-0.148R - 0.291G + 0.439B + 128)
+    //              V = clip( 0.439R - 0.368G - 0.071B + 128)
+    template <size_t N>
+    void rgb_to_yuv(const variable<float[N]>& r,
+                    const variable<float[N]>& g,
+                    const variable<float[N]>& b,
+                    const variable<float[N]>& y_out,
+                    const variable<float[N]>& u_out,
+                    const variable<float[N]>& v_out,
+                    bool do_round);
+
+    function_t _fn = nullptr;
+    variable<const float*> _consts;
+};
+
+jit_rgb_to_nv12_converter::jit_rgb_to_nv12_converter()
+    : jit_kernel(jit_name()),
+      _consts(*this) {}
+
+void jit_rgb_to_nv12_converter::init() {
+    OPENVINO_ASSERT(create_kernel() == status::success,
+                    "Can't generate jit RGB-to-NV12 converter kernel");
+    _fn = reinterpret_cast<function_t>(const_cast<uint8_t*>(jit_ker()));
+}
+
+template <size_t N>
+void jit_rgb_to_nv12_converter::deinterleave(const variable<float[N]>& v0,
+                                               const variable<float[N]>& v1,
+                                               const variable<float[N]>& v2,
+                                               const variable<float[N]>& ch0,
+                                               const variable<float[N]>& ch1,
+                                               const variable<float[N]>& ch2) {
+    // The forward interleave (blend in jit_uni_converter) for N channels uses:
+    //   genPermutationMask(k)[dest] = src   where dest = (src*3+k) % N
+    // The inverse permutation satisfies inv[(i*3+k)%N] = i, i.e.
+    //   inv[j] = j * inv3 % N   where inv3 * 3 ≡ 1 (mod N).
+    // For N=4:  inv3=3  (3*3=9≡1 mod 4? no: 9%4=1 ✓)
+    // For N=8:  inv3=3  (3*3=9≡1 mod 8? no: 9%8=1 ✓)
+    // For N=16: inv3=11 (3*11=33≡1 mod 16? 33%16=1 ✓)
+    // So inv[j] = (j * inv3) % N for channel k=0 (R/B channel).
+    //
+    // The unblend undoes the blend.  Because unblending is complex we
+    // instead compute inv_mask and apply permute, then read the already-
+    // scattered values with a matching inverse-blend.
+    //
+    // Concretely: apply the SAME permutation indices as the forward pass
+    // (because permute is an in-place reorder and forward+forward^{-1}=id),
+    // then apply the inverse-blend masks.
+    //
+    // In practice for this kernel we use a simpler approach: generate the
+    // inverse permutation arrays at compile time and call .permute().
+
+    auto gen_inv_perm = [](int ch) {
+        // inverse perm: inv[j] = i such that (i*3+ch)%N == j
+        //                      = (j - ch) * inv3 % N  (adjusted for negatives)
+        size_t inv3;
+        if constexpr (N == 4)  inv3 = 3;
+        else if constexpr (N == 8)  inv3 = 3;
+        else /* N == 16 */  inv3 = 11;
+
+        std::array<uint8_t, N> mask{};
+        for (size_t j = 0; j < N; ++j) {
+            // find i s.t. (i*3 + ch) % N == j
+            // => i = (j - ch + N) * inv3 % N
+            mask[j] = static_cast<uint8_t>(((j + N - static_cast<size_t>(ch)) * inv3) % N);
+        }
+        return mask;
+    };
+
+    // Step 1: permute each of the three input registers
+    auto p0 = v0.permute(gen_inv_perm(0));   // elements destined for channel 0 (R/B)
+    auto p1 = v1.permute(gen_inv_perm(0));
+    auto p2 = v2.permute(gen_inv_perm(0));
+
+    // Step 2: extract the correct lanes from (p0, p1, p2) into ch0.
+    // The forward blend for output register k used blendMask[k].
+    // Inverse: ch0[i] comes from the register whose forward output register
+    // had that element.  We re-derive the inverse-blend masks.
+    //
+    // blendMask pattern (from jit_uni_converter):
+    //   static const uint32_t blendMasks[2] = {0x92492492, 0x24924924};
+    //   mask0 = blendMasks[0] >> ((offset*N) % 3)
+    //   mask1 = blendMasks[1] >> ((offset*N) % 3)
+    // For ch0 extraction from output-reg 0 (offset=0):
+    //   result = r_perm; result.blend(g_perm, mask0); result.blend(b_perm, mask1)
+    // The same masks apply when going backward because:
+    //   out0 = blend(r_perm, g_perm, b_perm)  positions for r are mask==0,
+    //   so to recover r-perm positions from out0: use the same masks.
+    // We simply apply the inverse-blend (re-blend) for each output channel.
+
+    static const uint32_t fwdMasks[2] = {0x92492492u, 0x24924924u};
+
+    auto extract_ch = [&](int ch_offset,
+                          const variable<float[N]>& pa,
+                          const variable<float[N]>& pb,
+                          const variable<float[N]>& pc,
+                          const variable<float[N]>& out) {
+        // Permute each input according to this channel's permutation
+        auto qa = pa.permute(gen_inv_perm(ch_offset));
+        auto qb = pb.permute(gen_inv_perm(ch_offset));
+        auto qc = pc.permute(gen_inv_perm(ch_offset));
+
+        // For each output register idx (0,1,2) read the right source.
+        // blendWithMask(offset=idx) chose:
+        //   result = r; blend(g,mask0); blend(b,mask1)
+        // To go backward for each output reg idx:
+        //   ch lives in positions where mask==0 (for r=ch0), mask0 (for g=ch1), mask1 (for b=ch2)
+        // We pick the right element from whichever of pa/pb/pc contributed it.
+        // Because the 3-reg blend fully covers N slots with no gaps, reading
+        // the correct one is equivalent to applying the masks in the same way.
+        const auto m0 = static_cast<uint16_t>(fwdMasks[0] >> ((static_cast<size_t>(ch_offset) * N) % 3));
+        const auto m1 = static_cast<uint16_t>(fwdMasks[1] >> ((static_cast<size_t>(ch_offset) * N) % 3));
+
+        out = qa;
+        out = out.blend(qb, m0);
+        out = out.blend(qc, m1);
+    };
+
+    extract_ch(0, v0, v1, v2, ch0);
+    extract_ch(1, v0, v1, v2, ch1);
+    extract_ch(2, v0, v1, v2, ch2);
+}
+
+// BT.601 limited-range RGB→YUV constants:
+//   Y =  0.257R + 0.504G + 0.098B + 16
+//   U = -0.148R - 0.291G + 0.439B + 128
+//   V =  0.439R - 0.368G - 0.071B + 128
+//
+// Stored in _consts in order:
+//   [0] 0.257f  [1] 0.504f  [2] 0.098f  [3] 16.f
+//   [4] 0.148f  [5] 0.291f  [6] 0.439f  [7] 128.f
+//   [8] 0.368f  [9] 0.071f  [10] 255.f  (clip ceil)
+
+template <size_t N>
+void jit_rgb_to_nv12_converter::rgb_to_yuv(const variable<float[N]>& r,
+                                             const variable<float[N]>& g,
+                                             const variable<float[N]>& b,
+                                             const variable<float[N]>& y_out,
+                                             const variable<float[N]>& u_out,
+                                             const variable<float[N]>& v_out,
+                                             bool do_round) {
+    auto tmp  = var<float[N]>();
+    auto zero = var<float[N]>();
+    auto ceil_val = var<float[N]>();
+
+    uni_vxorps(zero, zero, zero);
+    uni_vbroadcastss(ceil_val, ptr[_consts + 10 * sizeof(float)]);
+
+    auto clip = [&](const variable<float[N]>& x) {
+        if (do_round) {
+            uni_vroundps(x, x, 0);  // round to nearest
+        }
+        uni_vmaxps(x, x, zero);
+        uni_vminps(x, x, ceil_val);
+    };
+
+    // --- Y = 0.257R + 0.504G + 0.098B + 16 ---
+    uni_vbroadcastss(y_out, ptr[_consts + 0 * sizeof(float)]);  // y = 0.257
+    uni_vmulps(y_out, y_out, r);                                  // y = 0.257R
+    uni_vbroadcastss(tmp, ptr[_consts + 1 * sizeof(float)]);    // tmp = 0.504
+    uni_vmulps(tmp, tmp, g);                                      // tmp = 0.504G
+    uni_vaddps(y_out, y_out, tmp);                                // y += 0.504G
+    uni_vbroadcastss(tmp, ptr[_consts + 2 * sizeof(float)]);    // tmp = 0.098
+    uni_vmulps(tmp, tmp, b);                                      // tmp = 0.098B
+    uni_vaddps(y_out, y_out, tmp);                                // y += 0.098B
+    uni_vbroadcastss(tmp, ptr[_consts + 3 * sizeof(float)]);    // tmp = 16
+    uni_vaddps(y_out, y_out, tmp);                                // y += 16
+    clip(y_out);
+
+    // --- U = -0.148R - 0.291G + 0.439B + 128 ---
+    uni_vbroadcastss(u_out, ptr[_consts + 6 * sizeof(float)]);  // u = 0.439
+    uni_vmulps(u_out, u_out, b);                                  // u = 0.439B
+    uni_vbroadcastss(tmp, ptr[_consts + 4 * sizeof(float)]);    // tmp = 0.148
+    uni_vmulps(tmp, tmp, r);                                      // tmp = 0.148R
+    uni_vsubps(u_out, u_out, tmp);                                // u -= 0.148R
+    uni_vbroadcastss(tmp, ptr[_consts + 5 * sizeof(float)]);    // tmp = 0.291
+    uni_vmulps(tmp, tmp, g);                                      // tmp = 0.291G
+    uni_vsubps(u_out, u_out, tmp);                                // u -= 0.291G
+    uni_vbroadcastss(tmp, ptr[_consts + 7 * sizeof(float)]);    // tmp = 128
+    uni_vaddps(u_out, u_out, tmp);                                // u += 128
+    clip(u_out);
+
+    // --- V = 0.439R - 0.368G - 0.071B + 128 ---
+    uni_vbroadcastss(v_out, ptr[_consts + 6 * sizeof(float)]);  // v = 0.439
+    uni_vmulps(v_out, v_out, r);                                  // v = 0.439R
+    uni_vbroadcastss(tmp, ptr[_consts + 8 * sizeof(float)]);    // tmp = 0.368
+    uni_vmulps(tmp, tmp, g);                                      // tmp = 0.368G
+    uni_vsubps(v_out, v_out, tmp);                                // v -= 0.368G
+    uni_vbroadcastss(tmp, ptr[_consts + 9 * sizeof(float)]);    // tmp = 0.071
+    uni_vmulps(tmp, tmp, b);                                      // tmp = 0.071B
+    uni_vsubps(v_out, v_out, tmp);                                // v -= 0.071B
+    uni_vbroadcastss(tmp, ptr[_consts + 7 * sizeof(float)]);    // tmp = 128
+    uni_vaddps(v_out, v_out, tmp);                                // v += 128
+    clip(v_out);
+}
+
+// ---------------------------------------------------------------------------
+// JitConverter<T[N]> for RGB→NV12
+// Processes N pixels per SIMD iteration.
+// One kernel call handles one pair of rows → two Y rows + one UV row.
+// ---------------------------------------------------------------------------
+template <typename T>
+class JitConverter;
+
+template <typename T, size_t N>
+class JitConverter<T[N]> : public jit_rgb_to_nv12_converter {
+private:
+    void generate() override;
+
+    // Load N pixels (3*N elements) from an interleaved RGB row into R, G, B.
+    // Advances src by 3*N*sizeof(T).
+    void load_rgb(const variable<const T*>& src,
+                  const variable<float[N]>& r,
+                  const variable<float[N]>& g,
+                  const variable<float[N]>& b,
+                  const variable<uint8_t>& color_fmt);
+
+    // Downsample N U (or V) values for a single row by averaging adjacent pairs
+    // → produces N/2 values packed into the low half of the register.
+    // The result is returned in 'out' (low N/2 lanes valid).
+    void hpair_avg(const variable<float[N]>& row0_uv,
+                   const variable<float[N]>& row1_uv,
+                   const variable<float[N]>& out);
+};
+
+template <typename T, size_t N>
+void JitConverter<T[N]>::load_rgb(const variable<const T*>& src,
+                                   const variable<float[N]>& r,
+                                   const variable<float[N]>& g,
+                                   const variable<float[N]>& b,
+                                   const variable<uint8_t>& color_fmt) {
+    // Load 3 packed float registers covering N pixels of interleaved data.
+    auto v0 = var<float[N]>();
+    auto v1 = var<float[N]>();
+    auto v2 = var<float[N]>();
+
+    const size_t step = N * sizeof(T);
+    load(v0, src);
+    src += step;
+    load(v1, src);
+    src += step;
+    load(v2, src);
+    src += step;
+
+    // Deinterleave into channel registers.
+    // ch0 = first channel (R for RGB, B for BGR)
+    // ch2 = last  channel (B for RGB, R for BGR)
+    auto ch0 = var<float[N]>();
+    auto ch1 = var<float[N]>();
+    auto ch2 = var<float[N]>();
+
+    deinterleave(v0, v1, v2, ch0, ch1, ch2);
+
+    // Assign R/G/B based on color format.
+    _if(color_fmt == 0)
+        ._then([&] {
+            r = ch0;  // ch0 = R
+            g = ch1;
+            b = ch2;
+        })
+        ._else([&] {
+            b = ch0;  // ch0 = B (BGR input)
+            g = ch1;
+            r = ch2;
+        });
+}
+
+template <typename T, size_t N>
+void JitConverter<T[N]>::hpair_avg(const variable<float[N]>& row0_uv,
+                                    const variable<float[N]>& row1_uv,
+                                    const variable<float[N]>& out) {
+    // Average row0 and row1 UV values vertically first:
+    //   vert_avg[i] = (row0_uv[i] + row1_uv[i]) * 0.5
+    // Then horizontally average adjacent pairs:
+    //   out[i] = (vert_avg[2i] + vert_avg[2i+1]) * 0.5
+    //          = (row0_uv[2i] + row0_uv[2i+1] + row1_uv[2i] + row1_uv[2i+1]) * 0.25
+    //
+    // We implement this using hadd (horizontal add) instructions:
+    //   hadd(a, a) → [a0+a1, a2+a3, a4+a5, a6+a7, a0+a1, a2+a3, a4+a5, a6+a7] (AVX)
+    // Then multiply by 0.25.
+
+    auto sum = var<float[N]>();
+    auto quarter = var<float[N]>();
+
+    uni_vaddps(sum, row0_uv, row1_uv);         // sum[i] = row0[i] + row1[i]
+    uni_vhaddps(out, sum, sum);                 // out[i] = sum[2i] + sum[2i+1]
+    uni_vbroadcastss(quarter, ptr[_consts + 11 * sizeof(float)]);  // 0.25f
+    uni_vmulps(out, out, quarter);
+}
+
+template <typename T, size_t N>
+void JitConverter<T[N]>::generate() {
+    preamble();
+
+    auto src0      = arg<const T*>(&Params::src0);
+    auto src1      = arg<const T*>(&Params::src1);
+    auto dst_y0    = arg<T*>(&Params::dst_y0);
+    auto dst_y1    = arg<T*>(&Params::dst_y1);
+    auto dst_uv    = arg<T*>(&Params::dst_uv);
+    auto width     = arg(&Params::width);
+    auto color_fmt = arg(&Params::colorFmt);
+
+    // BT.601 limited-range constants + clip ceiling
+    // [0..3]  Y coefficients + bias  : 0.257, 0.504, 0.098, 16
+    // [4..7]  U/V coefficients + bias: 0.148, 0.291, 0.439, 128
+    // [8..10] extra V coefficients + clip ceil: 0.368, 0.071, 255
+    // [11]    UV averaging factor: 0.25
+    static const float data[12] = {
+        0.257f, 0.504f, 0.098f, 16.f,
+        0.148f, 0.291f, 0.439f, 128.f,
+        0.368f, 0.071f, 255.f, 0.25f
+    };
+    _consts = data;
+
+    const auto reg_capacity_log = static_cast<size_t>(std::logb(N));
+    const size_t y_step  = N * sizeof(T);
+    const size_t uv_step = N * sizeof(T);
+
+    // Process full SIMD batches of N pixels
+    width >>= reg_capacity_log;
+
+    foreach(0, width, [&]([[maybe_unused]] const variable<size_t>& /*idx*/) {
+        auto r0 = var<float[N]>();
+        auto g0 = var<float[N]>();
+        auto b0 = var<float[N]>();
+        auto r1 = var<float[N]>();
+        auto g1 = var<float[N]>();
+        auto b1 = var<float[N]>();
+
+        load_rgb(src0, r0, g0, b0, color_fmt);
+        load_rgb(src1, r1, g1, b1, color_fmt);
+
+        // BT.601 RGB->YUV for both rows
+        auto y0 = var<float[N]>();
+        auto u0 = var<float[N]>();
+        auto v0 = var<float[N]>();
+        rgb_to_yuv(r0, g0, b0, y0, u0, v0, std::is_integral_v<T>);
+
+        auto y1 = var<float[N]>();
+        auto u1 = var<float[N]>();
+        auto v1 = var<float[N]>();
+        rgb_to_yuv(r1, g1, b1, y1, u1, v1, std::is_integral_v<T>);
+
+        // Store Y planes
+        store(dst_y0, y0);
+        dst_y0 += y_step;
+        store(dst_y1, y1);
+        dst_y1 += y_step;
+
+        // 2x2 block-average U and V -> N/2 values each
+        auto u_avg = var<float[N]>();
+        auto v_avg = var<float[N]>();
+        hpair_avg(u0, u1, u_avg);
+        hpair_avg(v0, v1, v_avg);
+
+        // Interleave u_avg[0..N/2-1] and v_avg[0..N/2-1] into
+        // [U0,V0, U1,V1, ..., U_{N/2-1}, V_{N/2-1}] and store to dst_uv.
+        // Spill to stack, interleave with compile-time mov loop, then copy to dst_uv.
+        auto u_stk  = stack(N * sizeof(T));
+        auto v_stk  = stack(N * sizeof(T));
+        auto uv_stk = stack(N * sizeof(T));
+
+        auto u_ptr  = var<T*>();
+        auto v_ptr  = var<T*>();
+        auto uv_ptr = var<T*>();
+        u_ptr  = u_stk.pointer();
+        v_ptr  = v_stk.pointer();
+        uv_ptr = uv_stk.pointer();
+
+        store(u_ptr, u_avg);
+        store(v_ptr, v_avg);
+
+        {
+            const auto& aframe = address_frame(sizeof(T));
+            const Reg64& ureg   = static_cast<const Xbyak::Reg64&>(u_ptr);
+            const Reg64& vreg   = static_cast<const Xbyak::Reg64&>(v_ptr);
+            const Reg64& outreg = static_cast<const Xbyak::Reg64&>(uv_ptr);
+            auto tmp = reserve<typename reg_traits_by_size<sizeof(T)>::type>();
+            for (size_t k = 0; k < N / 2; ++k) {
+                mov(tmp, aframe[ureg   + k * sizeof(T)]);
+                mov(aframe[outreg + (2 * k)     * sizeof(T)], tmp);
+                mov(tmp, aframe[vreg   + k * sizeof(T)]);
+                mov(aframe[outreg + (2 * k + 1) * sizeof(T)], tmp);
+            }
+            free(tmp);
+        }
+
+        {
+            const Reg64& dst_reg = static_cast<const Xbyak::Reg64&>(dst_uv);
+            const Reg64& src_reg = static_cast<const Xbyak::Reg64&>(uv_ptr);
+            auto cnt = reserve<Xbyak::Reg64>();
+            mov(cnt, static_cast<size_t>(N));
+            copy<T>(dst_reg, src_reg, cnt);
+            free(cnt);
+        }
+        dst_uv += uv_step;
+    });
+
+    // Tail: remaining pixels (width % N). NV12 requires even width, so tail is even.
+    mov(width, argPtr(&Params::width));
+    width &= N - 1;
+
+    _if(width != 0)._then([&] {
+        auto v0t = var<float[N]>();
+        auto v1t = var<float[N]>();
+        auto v2t = var<float[N]>();
+        load(v0t, src0, width);
+        src0 += N * sizeof(T);
+        load(v1t, src0, width);
+        src0 += N * sizeof(T);
+        load(v2t, src0, width);
+        src0 += N * sizeof(T);
+
+        auto ch0t = var<float[N]>();
+        auto ch1t = var<float[N]>();
+        auto ch2t = var<float[N]>();
+        deinterleave(v0t, v1t, v2t, ch0t, ch1t, ch2t);
+
+        auto r0t = var<float[N]>();
+        auto g0t = var<float[N]>();
+        auto b0t = var<float[N]>();
+        _if(color_fmt == 0)
+            ._then([&] { r0t = ch0t; g0t = ch1t; b0t = ch2t; })
+            ._else([&] { b0t = ch0t; g0t = ch1t; r0t = ch2t; });
+
+        auto v0t2 = var<float[N]>();
+        auto v1t2 = var<float[N]>();
+        auto v2t2 = var<float[N]>();
+        load(v0t2, src1, width);
+        src1 += N * sizeof(T);
+        load(v1t2, src1, width);
+        src1 += N * sizeof(T);
+        load(v2t2, src1, width);
+        src1 += N * sizeof(T);
+
+        auto ch0t2 = var<float[N]>();
+        auto ch1t2 = var<float[N]>();
+        auto ch2t2 = var<float[N]>();
+        deinterleave(v0t2, v1t2, v2t2, ch0t2, ch1t2, ch2t2);
+
+        auto r1t = var<float[N]>();
+        auto g1t = var<float[N]>();
+        auto b1t = var<float[N]>();
+        _if(color_fmt == 0)
+            ._then([&] { r1t = ch0t2; g1t = ch1t2; b1t = ch2t2; })
+            ._else([&] { b1t = ch0t2; g1t = ch1t2; r1t = ch2t2; });
+
+        auto y0t  = var<float[N]>();
+        auto u0t  = var<float[N]>();
+        auto fv0t = var<float[N]>();
+        rgb_to_yuv(r0t, g0t, b0t, y0t, u0t, fv0t, std::is_integral_v<T>);
+
+        auto y1t  = var<float[N]>();
+        auto u1t  = var<float[N]>();
+        auto fv1t = var<float[N]>();
+        rgb_to_yuv(r1t, g1t, b1t, y1t, u1t, fv1t, std::is_integral_v<T>);
+
+        store(dst_y0, y0t, width);
+        store(dst_y1, y1t, width);
+
+        auto u_avgt = var<float[N]>();
+        auto v_avgt = var<float[N]>();
+        hpair_avg(u0t, u1t, u_avgt);
+        hpair_avg(fv0t, fv1t, v_avgt);
+
+        auto u_stkt  = stack(N * sizeof(T));
+        auto v_stkt  = stack(N * sizeof(T));
+        auto uv_stkt = stack(N * sizeof(T));
+        auto u_ptrt  = var<T*>();
+        auto v_ptrt  = var<T*>();
+        auto uv_ptrt = var<T*>();
+        u_ptrt  = u_stkt.pointer();
+        v_ptrt  = v_stkt.pointer();
+        uv_ptrt = uv_stkt.pointer();
+        store(u_ptrt, u_avgt);
+        store(v_ptrt, v_avgt);
+
+        {
+            const auto& aframe = address_frame(sizeof(T));
+            const Reg64& ureg   = static_cast<const Xbyak::Reg64&>(u_ptrt);
+            const Reg64& vreg   = static_cast<const Xbyak::Reg64&>(v_ptrt);
+            const Reg64& outreg = static_cast<const Xbyak::Reg64&>(uv_ptrt);
+            auto tmp = reserve<typename reg_traits_by_size<sizeof(T)>::type>();
+            for (size_t k = 0; k < N / 2; ++k) {
+                mov(tmp, aframe[ureg   + k * sizeof(T)]);
+                mov(aframe[outreg + (2 * k)     * sizeof(T)], tmp);
+                mov(tmp, aframe[vreg   + k * sizeof(T)]);
+                mov(aframe[outreg + (2 * k + 1) * sizeof(T)], tmp);
+            }
+            free(tmp);
+        }
+        {
+            const Reg64& dst_reg = static_cast<const Xbyak::Reg64&>(dst_uv);
+            const Reg64& src_reg = static_cast<const Xbyak::Reg64&>(uv_ptrt);
+            auto cnt = reserve<Xbyak::Reg64>();
+            mov(cnt, static_cast<const Xbyak::Reg64&>(width));
+            copy<T>(dst_reg, src_reg, cnt);
+            free(cnt);
+        }
+    });
+
+    postamble();
+}
+
+
+template <typename T>
+const jit_rgb_to_nv12_converter& jit_rgb_to_nv12_create() {
+    auto createKernel = []() {
+        std::unique_ptr<jit_rgb_to_nv12_converter> kernel;
+        if (mayiuse(cpu_isa_t::avx512_core)) {
+            auto c = new JitConverter<T[16]>;
+            kernel.reset(c);
+            c->init();
+        } else if (mayiuse(cpu_isa_t::avx2)) {
+            auto c = new JitConverter<T[8]>;
+            kernel.reset(c);
+            c->init();
+        } else if (mayiuse(cpu_isa_t::sse41)) {
+            auto c = new JitConverter<T[4]>;
+            kernel.reset(c);
+            c->init();
+        } else {
+            OPENVINO_THROW("Can't create jit RGB-to-NV12 converter kernel");
+        }
+        return kernel;
+    };
+    static auto kernel = createKernel();
+    return *kernel;
+}
+
+template <typename T>
+const jit_rgb_to_nv12_converter& jit_rgb_to_nv12_get() {
+    return jit_rgb_to_nv12_create<T>();
+}
+
+// Execute wrappers -------------------------------------------------------
+
+template <typename T>
+class SinglePlaneConvert<T, impl_desc_type::jit_uni> : public RefConverter {
+public:
+    explicit SinglePlaneConvert(Node* node) : RefConverter(node) {
+        jit_rgb_to_nv12_create<T>();
+    }
+
+    void execute(const CpuParallelPtr& cpu_parallel, [[maybe_unused]] const dnnl::stream& strm) override {
+        const auto& kernel   = jit_rgb_to_nv12_get<T>();
+        const auto& in_dims  = inputDims(0);
+        const size_t batch   = in_dims[N_DIM];
+        const size_t height  = in_dims[H_DIM];
+        const size_t width   = in_dims[W_DIM];
+
+        const T* src = static_cast<const T*>(input(0));
+        T* dst       = static_cast<T*>(output(0));
+        T* dst_y     = dst;
+        T* dst_uv    = dst + height * width;
+
+        const size_t stride_in  = height * width * 3;
+        const size_t stride_y   = height * width * 3 / 2;  // packed NV12 output stride
+        const size_t stride_uv  = height * width * 3 / 2;
+
+        cpu_parallel->parallel_for2d(batch, height / 2, [&](int b, int half_h) {
+            const size_t h0 = static_cast<size_t>(half_h) * 2;
+            const size_t h1 = h0 + 1;
+
+            typename jit_rgb_to_nv12_converter::Params args{
+                src  + static_cast<size_t>(b) * stride_in + h0 * width * 3,
+                src  + static_cast<size_t>(b) * stride_in + h1 * width * 3,
+                dst_y + static_cast<size_t>(b) * stride_y + h0 * width,
+                dst_y + static_cast<size_t>(b) * stride_y + h1 * width,
+                dst_uv + static_cast<size_t>(b) * stride_uv + static_cast<size_t>(half_h) * width,
+                width,
+                _colorFormat[0]};
+            kernel(args);
+        });
+    }
+};
+
+template <typename T>
+class TwoPlaneConvert<T, impl_desc_type::jit_uni> : public RefConverter {
+public:
+    explicit TwoPlaneConvert(Node* node) : RefConverter(node) {
+        jit_rgb_to_nv12_create<T>();
+    }
+
+    void execute(const CpuParallelPtr& cpu_parallel, [[maybe_unused]] const dnnl::stream& strm) override {
+        const auto& kernel   = jit_rgb_to_nv12_get<T>();
+        const auto& in_dims  = inputDims(0);
+        const size_t batch   = in_dims[N_DIM];
+        const size_t height  = in_dims[H_DIM];
+        const size_t width   = in_dims[W_DIM];
+
+        const T* src  = static_cast<const T*>(input(0));
+        T* dst_y      = static_cast<T*>(output(0));
+        T* dst_uv     = static_cast<T*>(output(1));
+
+        const size_t stride_in  = height * width * 3;
+        const size_t stride_y   = height * width;
+        const size_t stride_uv  = height * width / 2;
+
+        cpu_parallel->parallel_for2d(batch, height / 2, [&](int b, int half_h) {
+            const size_t h0 = static_cast<size_t>(half_h) * 2;
+            const size_t h1 = h0 + 1;
+
+            typename jit_rgb_to_nv12_converter::Params args{
+                src   + static_cast<size_t>(b) * stride_in + h0 * width * 3,
+                src   + static_cast<size_t>(b) * stride_in + h1 * width * 3,
+                dst_y + static_cast<size_t>(b) * stride_y  + h0 * width,
+                dst_y + static_cast<size_t>(b) * stride_y  + h1 * width,
+                dst_uv + static_cast<size_t>(b) * stride_uv + static_cast<size_t>(half_h) * width,
+                width,
+                _colorFormat[0]};
+            kernel(args);
+        });
+    }
+};
+
+#endif  // OPENVINO_ARCH_X86_64
 
 }  // namespace rgb_to_nv12
 }  // namespace
@@ -1260,19 +1943,30 @@ void ColorConvert::initSupportedI420Impls() {
 }
 
 void ColorConvert::initSupportedtoNV12Impls() {
-#define SUPPORTED_IMPL(Impl, type, desc_type)                              \
-    [](Node* node) {                                                       \
-        return new rgb_to_nv12::Impl<type, impl_desc_type::desc_type>(node); \
+#define SUPPORTED_IMPL(Impl, type, desc_type)                                 \
+    [](Node* node) {                                                           \
+        return new rgb_to_nv12::Impl<type, impl_desc_type::desc_type>(node);  \
     };
 
-    // ref — the only implementation for now; JIT support will be added later.
+    // ref
     {
         auto& impls = _supportedImpls[impl_desc_type::ref][algorithm];
-        impls[ov::element::Type_t::u8][true]  = SUPPORTED_IMPL(SinglePlaneConvert, uint8_t, ref);
-        impls[ov::element::Type_t::u8][false] = SUPPORTED_IMPL(TwoPlaneConvert,    uint8_t, ref);
+        impls[ov::element::Type_t::u8][true]   = SUPPORTED_IMPL(SinglePlaneConvert, uint8_t, ref);
+        impls[ov::element::Type_t::u8][false]  = SUPPORTED_IMPL(TwoPlaneConvert,    uint8_t, ref);
         impls[ov::element::Type_t::f32][true]  = SUPPORTED_IMPL(SinglePlaneConvert, float,   ref);
         impls[ov::element::Type_t::f32][false] = SUPPORTED_IMPL(TwoPlaneConvert,    float,   ref);
     }
+
+#if defined(OPENVINO_ARCH_X86_64)
+    // jit_uni
+    {
+        auto& impls = _supportedImpls[impl_desc_type::jit_uni][algorithm];
+        impls[ov::element::Type_t::u8][true]   = SUPPORTED_IMPL(SinglePlaneConvert, uint8_t, jit_uni);
+        impls[ov::element::Type_t::u8][false]  = SUPPORTED_IMPL(TwoPlaneConvert,    uint8_t, jit_uni);
+        impls[ov::element::Type_t::f32][true]  = SUPPORTED_IMPL(SinglePlaneConvert, float,   jit_uni);
+        impls[ov::element::Type_t::f32][false] = SUPPORTED_IMPL(TwoPlaneConvert,    float,   jit_uni);
+    }
+#endif
 #undef SUPPORTED_IMPL
 }
 
