@@ -205,9 +205,9 @@ void jit_uni_converter::yuv_to_rgb(const variable<float[N]>& y,
             return mask;
         };
 
-        r = r.permute(genPermutationMask(0));
-        g = g.permute(genPermutationMask(1));
-        b = b.permute(genPermutationMask(2));
+        std::ignore = r.permute(genPermutationMask(0));
+        std::ignore = g.permute(genPermutationMask(1));
+        std::ignore = b.permute(genPermutationMask(2));
 
         auto blendWithMask = [&](int offset, const variable<float[N]>& result) {
             static const uint32_t blendMasks[2] = {0x92492492, 0x24924924};
@@ -215,8 +215,8 @@ void jit_uni_converter::yuv_to_rgb(const variable<float[N]>& y,
             const auto mask1 = static_cast<uint16_t>(blendMasks[1] >> ((offset * N) % 3));
 
             result = r;
-            result = result.blend(g, mask0);
-            result = result.blend(b, mask1);
+            std::ignore = result.blend(g, mask0);
+            std::ignore = result.blend(b, mask1);
         };
 
         blendWithMask(0, r0);
@@ -849,8 +849,8 @@ JitConverter<T[N]>::load_yuv(const variable<const T*>& src_y,
 template <typename T, size_t N>
 void JitConverter<T[N]>::unpack_uv(const variable<float[N]>& u, const variable<float[N]>& v) {
     static const uint8_t order[] = {0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7};
-    u = u.permute(order);
-    v = v.permute(order);
+    std::ignore = u.permute(order);
+    std::ignore = v.permute(order);
 }
 
 template <typename T>
@@ -1249,27 +1249,6 @@ void jit_rgb_to_nv12_converter::deinterleave(const variable<float[N]>& v0,
         return mask;
     };
 
-    // Step 1: permute each of the three input registers
-    auto p0 = v0.permute(gen_inv_perm(0));   // elements destined for channel 0 (R/B)
-    auto p1 = v1.permute(gen_inv_perm(0));
-    auto p2 = v2.permute(gen_inv_perm(0));
-
-    // Step 2: extract the correct lanes from (p0, p1, p2) into ch0.
-    // The forward blend for output register k used blendMask[k].
-    // Inverse: ch0[i] comes from the register whose forward output register
-    // had that element.  We re-derive the inverse-blend masks.
-    //
-    // blendMask pattern (from jit_uni_converter):
-    //   static const uint32_t blendMasks[2] = {0x92492492, 0x24924924};
-    //   mask0 = blendMasks[0] >> ((offset*N) % 3)
-    //   mask1 = blendMasks[1] >> ((offset*N) % 3)
-    // For ch0 extraction from output-reg 0 (offset=0):
-    //   result = r_perm; result.blend(g_perm, mask0); result.blend(b_perm, mask1)
-    // The same masks apply when going backward because:
-    //   out0 = blend(r_perm, g_perm, b_perm)  positions for r are mask==0,
-    //   so to recover r-perm positions from out0: use the same masks.
-    // We simply apply the inverse-blend (re-blend) for each output channel.
-
     static const uint32_t fwdMasks[2] = {0x92492492u, 0x24924924u};
 
     auto extract_ch = [&](int ch_offset,
@@ -1278,24 +1257,22 @@ void jit_rgb_to_nv12_converter::deinterleave(const variable<float[N]>& v0,
                           const variable<float[N]>& pc,
                           const variable<float[N]>& out) {
         // Permute each input according to this channel's permutation
-        auto qa = pa.permute(gen_inv_perm(ch_offset));
-        auto qb = pb.permute(gen_inv_perm(ch_offset));
-        auto qc = pc.permute(gen_inv_perm(ch_offset));
+        auto qa = var<float[N]>();
+        auto qb = var<float[N]>();
+        auto qc = var<float[N]>();
+        qa = pa;
+        qb = pb;
+        qc = pc;
+        std::ignore = qa.permute(gen_inv_perm(ch_offset));
+        std::ignore = qb.permute(gen_inv_perm(ch_offset));
+        std::ignore = qc.permute(gen_inv_perm(ch_offset));
 
-        // For each output register idx (0,1,2) read the right source.
-        // blendWithMask(offset=idx) chose:
-        //   result = r; blend(g,mask0); blend(b,mask1)
-        // To go backward for each output reg idx:
-        //   ch lives in positions where mask==0 (for r=ch0), mask0 (for g=ch1), mask1 (for b=ch2)
-        // We pick the right element from whichever of pa/pb/pc contributed it.
-        // Because the 3-reg blend fully covers N slots with no gaps, reading
-        // the correct one is equivalent to applying the masks in the same way.
         const auto m0 = static_cast<uint16_t>(fwdMasks[0] >> ((static_cast<size_t>(ch_offset) * N) % 3));
         const auto m1 = static_cast<uint16_t>(fwdMasks[1] >> ((static_cast<size_t>(ch_offset) * N) % 3));
 
         out = qa;
-        out = out.blend(qb, m0);
-        out = out.blend(qc, m1);
+        std::ignore = out.blend(qb, m0);
+        std::ignore = out.blend(qc, m1);
     };
 
     extract_ch(0, v0, v1, v2, ch0);
