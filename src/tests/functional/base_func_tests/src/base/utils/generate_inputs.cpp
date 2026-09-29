@@ -1044,6 +1044,14 @@ const InputsMap& getInputMap() {
     const static InputsMap inputsMap{
 #define _OPENVINO_OP_REG(NAME, NAMESPACE) {NAMESPACE::NAME::get_type_info_static(), generateInput<NAMESPACE::NAME>},
 
+#include "openvino/opsets/opset10_tbl.hpp"
+#include "openvino/opsets/opset11_tbl.hpp"
+#include "openvino/opsets/opset12_tbl.hpp"
+#include "openvino/opsets/opset13_tbl.hpp"
+#include "openvino/opsets/opset14_tbl.hpp"
+#include "openvino/opsets/opset15_tbl.hpp"
+#include "openvino/opsets/opset16_tbl.hpp"
+#include "openvino/opsets/opset17_tbl.hpp"
 #include "openvino/opsets/opset1_tbl.hpp"
 #include "openvino/opsets/opset2_tbl.hpp"
 #include "openvino/opsets/opset3_tbl.hpp"
@@ -1053,14 +1061,6 @@ const InputsMap& getInputMap() {
 #include "openvino/opsets/opset7_tbl.hpp"
 #include "openvino/opsets/opset8_tbl.hpp"
 #include "openvino/opsets/opset9_tbl.hpp"
-#include "openvino/opsets/opset10_tbl.hpp"
-#include "openvino/opsets/opset11_tbl.hpp"
-#include "openvino/opsets/opset12_tbl.hpp"
-#include "openvino/opsets/opset13_tbl.hpp"
-#include "openvino/opsets/opset14_tbl.hpp"
-#include "openvino/opsets/opset15_tbl.hpp"
-#include "openvino/opsets/opset16_tbl.hpp"
-
 #include "ov_ops/opset_private_tbl.hpp"
 #undef _OPENVINO_OP_REG
     };

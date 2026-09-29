@@ -42,9 +42,9 @@ void ConvertColorToNV12LayerTest::SetUp() {
 
     std::shared_ptr<ov::Node> convert_color;
     if (conversionToRGB) {
-        convert_color = std::make_shared<ov::op::v17::RGBtoNV12>(param);
+        convert_color = std::make_shared<ov::op::v17::RGBtoNV12>(param, single_plane);
     } else {
-        convert_color = std::make_shared<ov::op::v17::BGRtoNV12>(param);
+        convert_color = std::make_shared<ov::op::v17::BGRtoNV12>(param, single_plane);
     }
     function = std::make_shared<ov::Model>(convert_color->outputs(), ov::ParameterVector{param}, "ConvertColorToNV12");
 }

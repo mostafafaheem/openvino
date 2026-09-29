@@ -35,7 +35,7 @@ const std::vector<ov::element::Type> inTypes = {ov::element::u8,
                                                 ov::element::f64};
 const std::vector<std::vector<ov::Shape>> in_shapes_acc = {{{1, 64, 96, 3}}};
 
-const std::vector<std::vector<ov::Shape>> in_shapes_nightly = {{{1, 256, 256, 3}}, {{1, 720, 1280, 3}}};
+const std::vector<std::vector<ov::Shape>> in_shapes_nightly = {{{1, 256 * 256 * 16, 256, 3}}};
 
 const auto test_case_values =
     ::testing::Combine(::testing::ValuesIn(ov::test::static_shapes_to_test_representation(in_shapes)),
@@ -44,7 +44,7 @@ const auto test_case_values =
                        ::testing::Bool(),
                        ::testing::Values(ov::test::utils::DEVICE_CPU));
 
-INSTANTIATE_TEST_SUITE_P(smoke_TestsConvertColorToNV12_Single_Plane,
+INSTANTIATE_TEST_SUITE_P(smoke_TestsConvertColorToNV12,
                          ConvertColorToNV12LayerTest,
                          test_case_values,
                          ConvertColorToNV12LayerTest::getTestCaseName);
@@ -65,7 +65,7 @@ const auto testCase_accuracy_values_nightly =
     ::testing::Combine(::testing::ValuesIn(ov::test::static_shapes_to_test_representation(in_shapes_nightly)),
                        ::testing::Values(ov::element::u8),
                        ::testing::Bool(),
-                       ::testing::Values(true),
+                       ::testing::Bool(),
                        ::testing::Values(ov::test::utils::DEVICE_CPU));
 
 INSTANTIATE_TEST_SUITE_P(nightly_TestsConvertColorToNV12_acc,

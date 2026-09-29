@@ -94,7 +94,7 @@ TYPED_TEST_P(ConvertColorToNV12Test, two_plane_static_rank) {
     this->input_shapes = StaticShapeVector{{5, 20, 20, 3}};
     auto output_shapes = shape_inference(this->op.get(), this->input_shapes);
 
-    EXPECT_EQ(output_shapes.size(), 1);
+    EXPECT_EQ(output_shapes.size(), 2);
     EXPECT_EQ(output_shapes[0], StaticShape({5, 20, 20, 1}));
     EXPECT_EQ(output_shapes[1], StaticShape({5, 10, 10, 2}));
 }
