@@ -148,6 +148,8 @@ static const TypeToNameMap& get_type_to_name_tbl() {
         {"NV12toBGR", Type::ColorConvert},
         {"I420toRGB", Type::ColorConvert},
         {"I420toBGR", Type::ColorConvert},
+        {"RGBtoNV12", Type::ColorConvert},
+        {"BGRtoNV12", Type::ColorConvert},
         {"Col2Im", Type::Col2Im},
         {"MVN", Type::MVN},
         {"NormalizeL2", Type::NormalizeL2},
